@@ -1,0 +1,291 @@
+#------拟时序分析------
+#0.准备工作
+#清除环境变量、释放内存
+rm(list = ls())
+gc()
+
+#设置工作路径
+setwd("工作路径")
+getwd("工作路径")
+
+#读包
+library(monocle)
+library(Seurat)
+library(tidyverse)
+library(igraph)
+library(ggraph)
+library(ggplot2)
+library(ggnetwork)
+library(dplyr)
+library(tidyr)
+
+#1.数据预处理
+#读取seurat对象文件
+sce<-readRDS("seurat.rds")
+dim(sce)
+colnames(sce@meta.data)
+unique(sce$celltype)
+#筛选需要的细胞子集
+sce1<-sce[,sce$celltype%in%c("DN-CSKMT","CD4 Naive","CD4-TIMP1","CD4 Treg","CD4-MACF1")]
+#随机抽样10%
+library(SeuratData)
+library(patchwork)
+dim(sce1)#目前子集的gene和cell数，根据细胞量看需要抽多少细胞
+
+total_cells <- length(colnames(sce1))#计算细胞数
+set.seed(123)#设置随机种子，保证可重复
+sample_size <- round(0.1 * total_cells)
+sample_cells <- sample(colnames(sce1), sample_size)#随机抽取细胞名
+sce2 <- subset(sce1, cells = sample_cells)#子集化
+DimPlot(sce)|
+  DimPlot(sce1)|
+  DimPlot(sce2)
+sce<-sce2
+
+#2.monocle流程
+#2.1提取表型信息
+#细胞信息(建议载入细胞的聚类或者细胞类型鉴定信息、实验条件等信息)
+expr_matrix <- as(as.matrix(sce@assays$RNA@counts), 'sparseMatrix')#稀疏矩阵
+#提取表型信息到p_data(phenotype_data)里面 
+#p_data <- sce@meta.data 
+#pd <- new('AnnotatedDataFrame', data = p_data) #将data.frame转换为AnnotatedDataFrame对象
+pd<-new('AnnotatedDataFrame',data =sce@meta.data)
+#提取基因信息 如生物类型、gc含量等
+f_data <- data.frame(gene_short_name = row.names(sce),row.names = row.names(sce))
+##expr_matrix的行数与f_data的行数相同(gene number), expr_matrix的列数与p_data的行数相同(cell number)
+fd <- new('AnnotatedDataFrame', data = f_data)#将data.frame转换为AnnotatedDataFrame对象
+
+#2.2构建CDS对象
+cds_pre <- newCellDataSet(expr_matrix,
+                          phenoData = pd,
+                          featureData = fd,
+                          expressionFamily = negbinomial.size())#选择表达矩阵的分布情况
+#2.3celldataset的预处理
+cds_pre <- estimateSizeFactors(cds_pre)
+cds_pre <- estimateDispersions(cds_pre)#可以选择多线程，estimateDispersions(cds_pre,cores =10,relative_expr = T)
+
+#2.4选择高变基因并降维
+#选取marker基因，第一个方法速度较慢，一般选用seurat找高变基因
+#high dispersion gene by monocle
+#gene_Disp = dispersionTable(cds_pre)#计算基因的离散度
+#gene_sle = gene_Disp %>%  dplyr::filter(mean_expression >= 0.05,dispersion_empirical >= 1*dispersion_fit) %>% pull(gene_id) %>% unique()
+#cds <- setOrderingFilter(cds_pre, gene_sle)
+#cds <- reduceDimension(cds, method = 'DDRTree')
+##使用seurat选择的高变基因
+express_genes <- VariableFeatures(sce)
+cds <- setOrderingFilter(cds_pre, express_genes)
+cds <- reduceDimension(cds, method = 'DDRTree')#降维
+
+#2.5排序,得到轨迹分化相关的若干State
+cds <- orderCells(cds)#排序
+
+#3.拟时序的初步可视化
+plot_cell_trajectory(cds, color_by = "Pseudotime")|
+  plot_cell_trajectory(cds, color_by = "celltype")|
+  plot_cell_trajectory(cds, color_by = "State")
+
+#3.1根据生物学意义判断起始点“state”
+cds<-orderCells(cds,root_state = 8) #修改后再看轨迹
+
+#P.储存cds文件
+getwd()
+dir.create("cds")
+setwd("~/cds")
+saveRDS(cds,"CD4_10%_cds.rds")
+cds<-readRDS(file = "CD4_10%_cds.rds")
+
+#4.拟时序可视化
+library(monocle)
+
+#4.1拟时序轨迹图
+#细胞类型着色
+cds$celltype<-factor(cds$celltype,levels = c("DN-CSKMT", "CD4-MACF1","CD4 Naive","CD4 Treg","CD4-TIMP1" ))
+color<-c("#F5C7E4","#FCED82","#D55640","#E69F84","#EE934E" )#与celltype一一对应
+plot_cell_trajectory(cds, color_by = 'celltype')+
+  scale_colour_manual(values=color)+
+  guides(color = guide_legend(override.aes = list(size =4) , nrow = 2,byrow = TRUE))+##调整图例点大小
+  theme(
+    axis.text = element_blank(),  # 去除轴上的文本
+    axis.title = element_blank(), # 去除轴标题
+    axis.ticks = element_blank(),  # 去除轴上的刻度线
+    axis.line.x  = element_blank(),# 去除x轴线
+    axis.line.y  = element_blank() # 去除y轴线
+  )|
+#拟时序着色
+plot_cell_trajectory(cds, color_by = 'Pseudotime')+##调整图例点大小
+  theme(legend.position = c(1.15, 0.5),
+        legend.text = element_text(size=12),
+        legend.title = element_text(size=14),
+        axis.text = element_blank(),  # 去除轴上的文本
+        axis.title = element_blank(), # 去除轴标题
+        axis.ticks = element_blank(),  # 去除轴上的刻度线
+        axis.line.x  = element_blank(),# 去除x轴线
+        axis.line.y  = element_blank(), # 去除y轴线
+        plot.margin = margin(0, 100, 0, 0)
+  )###这个结合theme函数第一行图例位置的可以改变图例存在与否，第二个数字改为0则无图例，改为100则为出现图例
+
+#4.2拟时序密度图
+library(ggpubr)
+df <- pData(cds) #pData(cds)取出的是cds对象中cds@phenoData@data的内容
+ggplot(df, aes(Pseudotime, colour = celltype, fill=celltype))+
+  scale_fill_manual(values=color,name = "Cell type")+
+  scale_color_manual(values=color,name = "Cell type")+
+  geom_density(bw=0.5,size=1,alpha = 0.5)+theme_classic2()+
+  theme(axis.text = element_text(colour = "black"))
+
+
+#4.3.1拟时序差异基因热图
+#这里是把排序基因（ordergene）提取出来做回归分析，来找它们是否跟拟时间有显著的关系
+#如果不设置，就会用所有基因来做它们与拟时间的相关性
+library(RColorBrewer)
+#sce<-readRDS("~.rds")#读取用于做拟时序的seurat对象文件
+ordergene <- VariableFeatures(sce)#使用seurat选择的高变基因
+Time_diff <- differentialGeneTest(cds[ordergene,], cores = 1, 
+                                  fullModelFormulaStr = "~sm.ns(Pseudotime)")#差异表达分析
+head(Time_diff)
+#####所有基因【不选】
+Time_genes <- Time_diff %>% pull(gene_short_name) %>% as.character()
+P1<-plot_pseudotime_heatmap(cds[Time_genes,], num_clusters=4, show_rownames=T, return_heatmap=T)
+###top1000基因【不选】
+Time_genes <- Time_diff %>%arrange(qval) %>%head(1000) %>% pull(gene_short_name) %>% as.character()
+P2<-plot_pseudotime_heatmap(cds[Time_genes,], num_clusters=4, show_rownames=F, return_heatmap=T)
+###显著性基因【选】
+Time_genes <- Time_diff %>%filter(qval<0.05)%>% pull(gene_short_name) %>% as.character()
+P3<-plot_pseudotime_heatmap(cds[Time_genes,], num_clusters=6, show_rownames=F, return_heatmap=T)
+#如果存在低质量gene，会导致计算权重矩阵时失败，重新过滤基因后再进行绘制。
+#检查每个基因的表达情况
+expressed_genes <- rownames(cds)[rowSums(exprs(cds) > 0) > 10]  # 在至少10个细胞中有表达
+#保留Time_genes中真正有表达的基因
+Time_genes_filtered <- intersect(Time_genes, expressed_genes)#取交集
+#重新画图
+P3 <- plot_pseudotime_heatmap(cds[Time_genes_filtered, ], 
+                              num_clusters = 2, 
+                              show_rownames = FALSE, 
+                              return_heatmap = TRUE,
+                              hmcols = colorRampPalette(c("navy","white","firebrick3"))(100))
+
+
+#4.3.2GO\KEGG富集分析
+# TYPE的可选类型：SYMBOL, ENSEMBL, ENTREZID
+# OrgDb的可选类型：'org.Dr.eg.db','org.Mm.eg.db','org.Hs.eg.db'
+library(org.Hs.eg.db) # 确保加载了org.Hs.eg.db包
+library(enrichplot)   # 确保加载了enrichplot包，用于可视化
+library(clusterProfiler)
+dir.create("pathway")
+getwd()
+setwd("~/pathway")
+# 初始化或清空错误信息文件
+#这行代码的作用是打开（或创建）一个名为 "error_messages.txt" 的文件，以追加模式进行写入。
+#这意味着任何写入这个文件的数据都会被添加到文件的末尾，而不会覆盖原有内容。
+#如果 "error_messages.txt" 文件不存在，这行代码将会创建这个文件。
+
+error_file <- file("error_messages.txt", "a")
+writeLines(c("Error log for enrichment analysis:", 
+             "------------------------------------------------",
+             'starting time at:', format(Sys.time(), "%Y-%m-%d %H:%M:%S"),
+             "------------------------------------------------"), 
+           error_file, useBytes = FALSE)
+dir.create("GO")
+dir.create("KEGG")
+
+#拆分拟时序分析轴上每个cluster的基因
+clusters <- cutree(P3$tree_row, k = 2)
+clustering <- as.data.frame(clusters)%>%rownames_to_column(var = "gene")
+colnames(clustering) <- c("gene","cluster")
+unique(clustering$cluster)
+
+for (i in unique(clustering$cluster)) {
+  # 尝试转换基因ID
+  gene <- tryCatch({
+    bitr(geneID = clustering$gene[clustering$cluster == i],
+         fromType = 'SYMBOL',
+         toType = 'ENTREZID',
+         OrgDb = 'org.Hs.eg.db')}, 
+    error = function(e) {
+      message_text <- paste("Error in gene ID conversion for :", i, ": ", e$message)
+      writeLines(message_text, error_file, useBytes = FALSE)
+      return(NULL)})
+  
+  # 如果基因ID转换失败，跳过当前循环的剩余部分
+  if (is.null(gene)) {
+    next  }
+  # 进行GO富集分析
+  ego <- tryCatch({
+    enrichGO(gene = gene$ENTREZID,
+             OrgDb = 'org.Hs.eg.db',
+             ont = "BP",
+             pvalueCutoff = 1,
+             qvalueCutoff = 1,
+             readable = TRUE)
+  }, error = function(e) {
+    message_text <- paste("Error in GO enrichment analysis for :", i, ": ", e$message)
+    writeLines(message_text, error_file, useBytes = FALSE)
+    return(NULL)})
+  # 检查是否富集出任何通路
+  # 保存GO富集分析结果
+  file_ego <- paste0("GO/",'Cluster_',i, "_GO_terms.csv", sep = "")
+  write.csv(summary(ego), file_ego)
+  ####kegg富集
+  kegg<-tryCatch({enrichKEGG(gene$ENTREZID,
+                             organism="hsa",
+                             pvalueCutoff=1,
+                             keyType="kegg",
+                             use_internal_data =T)
+  }, error = function(e) {
+    message_text <- paste("Error in KEGG enrichment analysis for :", i, ": ", e$message)
+    writeLines(message_text, error_file, useBytes = FALSE)
+    return(NULL)})
+  all_path = as.data.frame(KEGG.db::KEGGPATHID2NAME)
+  kegg@result$Description = all_path$path_name[match(kegg@result$ID, all_path$path_id)]
+  # 保存KEGG富集分析结果
+  file_kegg <- paste0("KEGG/",'Cluster_',i, "_KEGG_terms.csv", sep = "")
+  write.csv(kegg@result, file_kegg)
+}
+close(error_file)
+
+#4.4基因随拟时表达变化
+library(dplyr)
+library(monocle)
+library(ggplot2)
+library(Seurat)
+library(reshape2)
+colnames(pData(cds))
+#将需要展示的基因表达量添加到cds
+head(Time_genes_filtered)
+genes <- c( "NKG7",  "GNLY", "LTB","TNFAIP3","CST7")
+genes_exp <- list()
+
+for(i in 1:length(genes)){
+  A <- log2(exprs(cds)[genes[i],]+1)
+  A <- as.data.frame(A)
+  genes_exp[[i]] <- A
+}
+
+gene_exp <- do.call(cbind, genes_exp)
+colnames(gene_exp) <- genes
+#将上述几个基因的拟时表达添加到monocle
+pData(cds) = cbind(pData(cds), gene_exp)
+
+#提取作图数据，只需要游基因表达和拟时即可
+data <- pData(cds)
+colnames(data)
+#选择需要的列即可，我这里的origin.ident就是分组
+data<-data %>% select("celltype","Pseudotime","NKG7",  "GNLY", "LTB","TNFAIP3","CST7")
+
+#ggplot作图
+data_long_m<-melt(data, id.vars = c("celltype", "Pseudotime"), #需保留的不参与聚合的变量列名
+                  measure.vars = 3:7,#选择需要转化的列
+                  variable.name = c('gene'),#聚合变量的新列名
+                  value.name = 'value')#聚合值的新列名
+colnames(data_long_m)
+
+ggplot(data_long_m, aes(x = Pseudotime, y = value, color = celltype)) +
+  geom_smooth(aes(fill = celltype, group = interaction(gene, celltype))) + #用gene
+  xlab('Pseudotime') +
+  ylab('Relative expression') +
+  facet_wrap(~gene, scales = "free_y") + #用gene
+  theme(axis.text = element_text(color = 'black', size = 12),
+        axis.title = element_text(color = 'black', size = 14),
+        strip.text = element_text(color = 'black', size = 14)) +
+  scale_color_manual(name = NULL, values = color) +
+  scale_fill_manual(name = NULL, values = color)
